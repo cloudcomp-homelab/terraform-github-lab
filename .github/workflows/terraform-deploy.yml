@@ -1,0 +1,151 @@
+# ============================================================
+# TERRAFORM DEPLOYMENT - PLAN > APPROVE > APPLY
+# ============================================================
+name: terraform-deploy
+
+# ============================================================
+# TRIGGERS
+# ============================================================
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# ============================================================
+# PERMISSIONS (least privilege)
+# ============================================================
+permissions:
+  id-token: write   # required for OIDC login to Azure
+  contents: read    # required to checkout the repository
+
+# ============================================================
+# CONCURRENCY - one Terraform run at a time (shared state)
+# ============================================================
+concurrency:
+  group: terraform-github-lab
+  cancel-in-progress: false
+
+# ============================================================
+# VARIABLES
+# ============================================================
+env:
+  TERRAFORM_VERSION: 1.16.5
+  VAR_FILE: sandbox.tfvars
+  TF_IN_AUTOMATION: true
+  # Azure login via OIDC (read by the azurerm provider)
+  ARM_USE_OIDC: true
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  # ============================================================
+  # JOB 1 - PLAN ON PULL REQUEST (preview only)
+  # ============================================================
+  plan-pr:
+    name: Terraform plan (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        run: terraform plan -input=false -var-file=${{ env.VAR_FILE }} -out=tfplan
+
+      - name: Publish plan to job summary
+        run: |
+          {
+            echo '## Terraform plan (PR)'
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # JOB 2 - PLAN ON MAIN (this is the plan you approve)
+  # ============================================================
+  plan-main:
+    name: Terraform plan (main)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform plan
+        run: terraform plan -input=false -var-file=${{ env.VAR_FILE }} -out=tfplan
+
+      - name: Publish plan to job summary
+        run: |
+          {
+            echo '## Terraform plan (main) - review before approving'
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 1
+
+  # ============================================================
+  # JOB 3 - APPLY TO PRODUCTION (after approval, exact saved plan)
+  # ============================================================
+  apply:
+    name: Terraform apply (production)
+    needs: plan-main
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Terraform apply
+        run: terraform apply -input=false tfplan
